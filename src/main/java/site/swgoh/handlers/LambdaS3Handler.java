@@ -1,20 +1,23 @@
-package site.swgoh.swgoh_lambda.myHandler;
+package site.swgoh.handlers;
 
 
-import java.awt.Graphics;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URLDecoder;
+import java.sql.SQLException;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import javax.imageio.ImageIO;
 
+import org.apache.commons.io.IOUtils;
+import org.apache.log4j.Logger;
+
 import com.amazonaws.services.lambda.runtime.Context;
-import com.amazonaws.services.lambda.runtime.LambdaLogger;
 import com.amazonaws.services.lambda.runtime.events.S3Event;
 import com.amazonaws.services.s3.AmazonS3;
 import com.amazonaws.services.s3.AmazonS3ClientBuilder;
@@ -23,13 +26,18 @@ import com.amazonaws.services.s3.model.GetObjectRequest;
 import com.amazonaws.services.s3.model.ObjectMetadata;
 import com.amazonaws.services.s3.model.S3Object;
 
+import site.swgoh.beans.MemberData;
+import site.swgoh.helper.DBHelper;
+import site.swgoh.helper.ImageHelper;
+import site.swgoh.helper.OCRHelper;
+import site.swgoh.lists.DailyTrackingList;
+import site.swgoh.lists.OCRRecordList;
+
 //public class S3Test implements RequestHandler<S3Event, String> {
 public class LambdaS3Handler {
 	
-	private static final int START_X = 678;
-	private static final int START_Y = 388;
-	private static final int END_X = 1183;
-	private static final int END_Y = 537;
+	
+	static final Logger logger = Logger.getLogger(LambdaS3Handler.class);
 	
 	//private static final float MAX_WIDTH = 100;
     //private static final float MAX_HEIGHT = 100;
@@ -37,62 +45,65 @@ public class LambdaS3Handler {
     private final String JPG_MIME = (String) "image/jpeg";
     private final String PNG_TYPE = (String) "png";
     private final String PNG_MIME = (String) "image/png";
-    private final String DST_BUCKET = "";
+    private final String TXT_MINE = (String) "txt/plain";
+    private final String DST_BUCKET = System.getenv("output_bucket");
  
 
     public String handleRequest(S3Event s3event, Context context) {
+    	//LambdaLogger logger = context.getLogger();
         try {
-        	LambdaLogger logger = context.getLogger();
+        	
             S3EventNotificationRecord record = s3event.getRecords().get(0);
             
-
             String srcBucket = record.getS3().getBucket().getName();
-            logger.log("Processing in bucket: " + srcBucket);
+            logger.info("Processing in bucket: " + srcBucket);
             // Object key may have spaces or unicode non-ASCII characters.
             String srcKey = record.getS3().getObject().getKey().replace('+', ' ');
             srcKey = URLDecoder.decode(srcKey, "UTF-8");
 
-            String dstBucket = srcBucket + "-cropped";
+            String dstBucket = DST_BUCKET; //srcBucket + "-cropped";
             String dstKey = "cropped-" + srcKey;
 
             // Sanity check: validate that source and destination are different buckets.
             if (srcBucket.equals(dstBucket)) {
-                logger.log("Destination bucket must not match source bucket.");
+                logger.info("Destination bucket must not match source bucket.");
                 return "";
             }
 
             // Infer the image type.
             Matcher matcher = Pattern.compile(".*\\.([^\\.]*)").matcher(srcKey);
             if (!matcher.matches()) {
-                logger.log("Unable to infer image type for key " + srcKey);
+                logger.debug("Unable to infer image type for key " + srcKey);
                 return "";
             }
             String imageType = matcher.group(1);
             if (!(JPG_TYPE.equals(imageType)) && !(PNG_TYPE.equals(imageType))) {
-                logger.log("Skipping non-image " + srcKey);
+                logger.debug("Skipping non-image " + srcKey);
                 return "";
             }
 
             // Download the image from S3 into a stream
             //AmazonS3 s3Client = new AmazonS3Client();
+            logger.info("Getting instance of S3Client.");
             AmazonS3 s3Client = AmazonS3ClientBuilder.standard().build();
+            logger.info("S3 client instatiated.  Geting Object info.");
             S3Object s3Object = s3Client.getObject(new GetObjectRequest(srcBucket, srcKey));
-            logger.log("Getting object from S3 bucket.");
+            logger.info("Getting object from S3 bucket.");
             InputStream objectData = s3Object.getObjectContent();
-            logger.log("Object retrieved from S3");
+            logger.info("Object retrieved from S3");
             // Read the source image
             BufferedImage srcImage = ImageIO.read(objectData);
-            //srcImage.
-            BufferedImage croppedSrcImage = srcImage.getSubimage(START_X, START_Y, END_X, END_Y);
-            BufferedImage copyOfImage = new BufferedImage(croppedSrcImage.getWidth(), croppedSrcImage.getHeight(), BufferedImage.TYPE_INT_RGB);
-            Graphics g = copyOfImage.createGraphics();
-            g.drawImage(croppedSrcImage, 0, 0, null);
-            g.dispose();
+            BufferedImage copyOfImage = ImageHelper.resizeFile(srcImage);
             
+            // *********************************Save Cropped image to a bucket******************************
             // Re-encode image to target format
-            logger.log("Preparing to save to bucket.");
+            logger.info("Preparing to save to bucket.");
             ByteArrayOutputStream os = new ByteArrayOutputStream();
             ImageIO.write(copyOfImage, imageType, os);
+            
+            //File tmpFile = new File("tmp.png");
+            //ImageIO.write(copyOfImage, imageType, tmpFile);
+            
             InputStream is = new ByteArrayInputStream(os.toByteArray());
             // Set Content-Length and Content-Type
             ObjectMetadata meta = new ObjectMetadata();
@@ -103,15 +114,44 @@ public class LambdaS3Handler {
             if (PNG_TYPE.equals(imageType)) {
                 meta.setContentType(PNG_MIME);
             }
-
+            
+            
+          //Process copyOfImage for OCR
+            InputStream is2 = new ByteArrayInputStream(os.toByteArray());
+            OCRRecordList ocrReturnDataList = OCRHelper.getOCRData(is2, srcKey);
+            
             // Uploading to S3 destination bucket
-            logger.log("Writing to: " + dstBucket + "/" + dstKey);
+            logger.info("Writing to: " + dstBucket + "/" + dstKey);
             s3Client.putObject(dstBucket, dstKey, is, meta);
-            logger.log("Successfully cropped " + srcBucket + "/"
+            logger.info("Successfully cropped " + srcBucket + "/"
                     + srcKey + " and uploaded to " + dstBucket + "/" + dstKey);
+            
+            InputStream streamTxt = new ByteArrayInputStream(ocrReturnDataList.getJson().getBytes());
+            ObjectMetadata metaTxt = new ObjectMetadata();
+            metaTxt.setContentLength(streamTxt.available());
+            metaTxt.setContentType(TXT_MINE);
+            dstKey = dstKey.replace("png","txt");
+            s3Client.putObject(dstBucket, dstKey, streamTxt, metaTxt);
+            
+            //ocrReturnDataList
+            DailyTrackingList dailyList = new DailyTrackingList();
+            dailyList.addFileContents(ocrReturnDataList);
+            logger.info(dailyList.toString());
+            
+            for (MemberData md: dailyList){
+            	DBHelper.writeRecord(md);
+            }
+            DBHelper.getInstance().close();
+            
+            
             return "Ok";
         } catch (IOException e) {
             throw new RuntimeException(e);
-        }
+            
+        } catch (SQLException e) {
+			
+			e.printStackTrace();
+			return "Error";
+		}
     }
 }
