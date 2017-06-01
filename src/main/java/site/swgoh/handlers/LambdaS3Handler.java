@@ -126,18 +126,32 @@ public class LambdaS3Handler {
             logger.info("Successfully cropped " + srcBucket + "/"
                     + srcKey + " and uploaded to " + dstBucket + "/" + dstKey);
             
-            InputStream streamTxt = new ByteArrayInputStream(ocrReturnDataList.getJson().getBytes());
-            ObjectMetadata metaTxt = new ObjectMetadata();
-            metaTxt.setContentLength(streamTxt.available());
-            metaTxt.setContentType(TXT_MINE);
+            //Here we write the response JSON to a file
+            InputStream streamJSON = new ByteArrayInputStream(ocrReturnDataList.getJson().getBytes());
+            ObjectMetadata metaJSON = new ObjectMetadata();
+            metaJSON.setContentLength(streamJSON.available());
+            metaJSON.setContentType(TXT_MINE);
             dstKey = dstKey.replace("png","txt");
-            s3Client.putObject(dstBucket, dstKey, streamTxt, metaTxt);
+            s3Client.putObject(dstBucket, dstKey, streamJSON, metaJSON);
             
-            //ocrReturnDataList
+            //Map the ocrReturnDataList to a DailyTracking List of MemberData beans 
             DailyTrackingList dailyList = new DailyTrackingList();
             dailyList.addFileContents(ocrReturnDataList);
             logger.info(dailyList.toString());
             
+            //Need to write the MemberData elements to a CSVfile
+            InputStream streamCSV = new ByteArrayInputStream(dailyList.toString().getBytes());
+            ObjectMetadata metaCSV = new ObjectMetadata();
+            metaCSV.setContentLength(streamCSV.available());
+            metaCSV.setContentType(TXT_MINE);
+            dstKey = dstKey.replace("txt","csv");
+            s3Client.putObject(dstBucket, dstKey, streamCSV, metaCSV);
+            s3Client.shutdown();
+            
+            
+            
+            
+            //Write the MemberData elements to the database
             for (MemberData md: dailyList){
             	DBHelper.writeRecord(md);
             }
